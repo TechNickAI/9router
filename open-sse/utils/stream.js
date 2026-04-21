@@ -3,11 +3,36 @@ import { FORMATS } from "../translator/formats.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
 import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
+import { decloakToolNames } from "./claudeCloaking.js";
 
 export { COLORS, formatSSE };
 
 // sharedEncoder is stateless — safe to share across streams
 const sharedEncoder = new TextEncoder();
+
+// Rewrite cloaked tool names in an SSE chunk payload. Operates on the raw
+// text the transform emits (potentially multi-line), parses each data: line
+// as JSON, applies decloakToolNames, and re-serializes. Any line that
+// isn't JSON or doesn't carry a tool_use is passed through untouched.
+function decloakSSEText(text, toolNameMap) {
+  // Fast path: no tool_use in this chunk → nothing to do. This check is
+  // an order of magnitude cheaper than parsing every data: line.
+  if (!text.includes("tool_use")) return text;
+
+  return text.split("\n").map(line => {
+    if (!line.startsWith("data:")) return line;
+    const payload = line.slice(5).trimStart();
+    if (!payload || payload === "[DONE]") return line;
+    try {
+      const parsed = JSON.parse(payload);
+      const decloaked = decloakToolNames(parsed, toolNameMap);
+      if (decloaked === parsed) return line;
+      return "data: " + JSON.stringify(decloaked);
+    } catch {
+      return line;
+    }
+  }).join("\n");
+}
 
 /**
  * Stream modes
@@ -58,6 +83,19 @@ export function createSSEStream(options = {}) {
   let accumulatedContent = "";
   let accumulatedThinking = "";
   let ttftAt = null;
+
+  // Single-point guarantee: if Claude-format cloaked names are in play, every
+  // byte headed to the client first passes through decloakToolNames. This
+  // covers transform AND flush in both translate and passthrough modes, so
+  // new egress paths can't silently re-introduce the leak. See
+  // claudeCloaking.js for the full "exec_ide" symptom writeup.
+  const shouldDecloak = sourceFormat === FORMATS.CLAUDE && toolNameMap?.size > 0;
+
+  function emit(output, controller) {
+    const rewritten = shouldDecloak ? decloakSSEText(output, toolNameMap) : output;
+    reqLogger?.appendConvertedChunk?.(rewritten);
+    controller.enqueue(sharedEncoder.encode(rewritten));
+  }
 
   return new TransformStream({
     transform(chunk, controller) {
@@ -154,8 +192,7 @@ export function createSSEStream(options = {}) {
             }
           }
 
-          reqLogger?.appendConvertedChunk?.(output);
-          controller.enqueue(sharedEncoder.encode(output));
+          emit(output, controller);
           continue;
         }
 
@@ -169,8 +206,7 @@ export function createSSEStream(options = {}) {
         // For other formats: done=true is the [DONE] sentinel, skip
         if (parsed && parsed.done && targetFormat !== FORMATS.OLLAMA) {
           const output = "data: [DONE]\n\n";
-          reqLogger?.appendConvertedChunk?.(output);
-          controller.enqueue(sharedEncoder.encode(output));
+          emit(output, controller);
           continue;
         }
 
@@ -246,8 +282,7 @@ export function createSSEStream(options = {}) {
             }
 
             const output = formatSSE(item, sourceFormat);
-            reqLogger?.appendConvertedChunk?.(output);
-            controller.enqueue(sharedEncoder.encode(output));
+            emit(output, controller);
           }
         }
       }
@@ -265,8 +300,7 @@ export function createSSEStream(options = {}) {
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
               output = "data: " + buffer.slice(5);
             }
-            reqLogger?.appendConvertedChunk?.(output);
-            controller.enqueue(sharedEncoder.encode(output));
+            emit(output, controller);
           }
 
           if (!hasValidUsage(usage) && totalContentLength > 0) {
@@ -283,9 +317,7 @@ export function createSSEStream(options = {}) {
           // Some clients (e.g. OpenClaw) expect the OpenAI-style sentinel:
           //   data: [DONE]\n\n
           // Without it they can hang until timeout and trigger failover.
-          const doneOutput = "data: [DONE]\n\n";
-          reqLogger?.appendConvertedChunk?.(doneOutput);
-          controller.enqueue(sharedEncoder.encode(doneOutput));
+          emit("data: [DONE]\n\n", controller);
 
           if (onStreamComplete) {
             onStreamComplete({
@@ -310,9 +342,7 @@ export function createSSEStream(options = {}) {
 
             if (translated?.length > 0) {
               for (const item of translated) {
-                const output = formatSSE(item, sourceFormat);
-                reqLogger?.appendConvertedChunk?.(output);
-                controller.enqueue(sharedEncoder.encode(output));
+                emit(formatSSE(item, sourceFormat), controller);
               }
             }
           }
@@ -329,15 +359,11 @@ export function createSSEStream(options = {}) {
 
         if (flushed?.length > 0) {
           for (const item of flushed) {
-            const output = formatSSE(item, sourceFormat);
-            reqLogger?.appendConvertedChunk?.(output);
-            controller.enqueue(sharedEncoder.encode(output));
+            emit(formatSSE(item, sourceFormat), controller);
           }
         }
 
-        const doneOutput = "data: [DONE]\n\n";
-        reqLogger?.appendConvertedChunk?.(doneOutput);
-        controller.enqueue(sharedEncoder.encode(doneOutput));
+        emit("data: [DONE]\n\n", controller);
 
         if (!hasValidUsage(state?.usage) && totalContentLength > 0) {
           state.usage = estimateUsage(body, totalContentLength, sourceFormat);
@@ -378,11 +404,13 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, sourceFormat = null, toolNameMap = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
+    sourceFormat,
     provider,
     reqLogger,
+    toolNameMap,
     model,
     connectionId,
     body,
