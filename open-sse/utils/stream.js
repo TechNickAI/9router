@@ -20,7 +20,7 @@ const sharedEncoder = new TextEncoder();
 // for the full "exec_ide" symptom writeup.
 function decloakSSELine(line, toolNameMap) {
   if (!line.startsWith("data:") || !line.includes("tool_use")) return line;
-  const payload = line.slice(5).trimStart();
+  const payload = line.slice(5).trim();
   if (!payload || payload === "[DONE]") return line;
   try {
     const parsed = JSON.parse(payload);

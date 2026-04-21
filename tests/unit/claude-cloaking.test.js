@@ -196,6 +196,30 @@ describe("Claude passthrough cloak/decloak symmetry", () => {
     expect(output).not.toMatch(/_ide/);
   });
 
+  it("decloaks with CRLF line endings (trimStart left trailing \\r, breaking JSON.parse)", async () => {
+    // SSE spec allows \r\n, \r, or \n. buffer.split("\n") leaves a
+    // trailing \r on each line when upstream uses CRLF. A payload like
+    // `{"name":"read_ide"}\r` is not valid JSON, so trimStart()-only
+    // handling silently falls into the catch path and returns the original
+    // cloaked line. Full trim() is required.
+    const toolNameMap = new Map([["read_ide", "read"]]);
+
+    const input =
+      "event: content_block_start\r\n" +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_crlf","name":"read_ide","input":{}}}\r\n' +
+      "\r\n";
+
+    const stream = createPassthroughStreamWithLogger(
+      null, null, null, null, null, null, null,
+      FORMATS.CLAUDE, toolNameMap,
+    );
+
+    const output = await runStream(stream, [input]);
+
+    expect(output).not.toMatch(/_ide/);
+    expect(output).toContain('"name":"read"');
+  });
+
   it("passes cloaked names through unchanged when toolNameMap is empty (gate check)", async () => {
     // The gate is `toolNameMap?.size > 0`. A refactor to `toolNameMap != null`
     // would silently start decloaking when there's nothing to decloak (and
