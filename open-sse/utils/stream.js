@@ -10,28 +10,26 @@ export { COLORS, formatSSE };
 // sharedEncoder is stateless — safe to share across streams
 const sharedEncoder = new TextEncoder();
 
-// Rewrite cloaked tool names in an SSE chunk payload. Operates on the raw
-// text the transform emits (potentially multi-line), parses each data: line
-// as JSON, applies decloakToolNames, and re-serializes. Any line that
-// isn't JSON or doesn't carry a tool_use is passed through untouched.
-function decloakSSEText(text, toolNameMap) {
-  // Fast path: no tool_use in this chunk → nothing to do. This check is
-  // an order of magnitude cheaper than parsing every data: line.
-  if (!text.includes("tool_use")) return text;
-
-  return text.split("\n").map(line => {
-    if (!line.startsWith("data:")) return line;
-    const payload = line.slice(5).trimStart();
-    if (!payload || payload === "[DONE]") return line;
-    try {
-      const parsed = JSON.parse(payload);
-      const decloaked = decloakToolNames(parsed, toolNameMap);
-      if (decloaked === parsed) return line;
-      return "data: " + JSON.stringify(decloaked);
-    } catch {
-      return line;
-    }
-  }).join("\n");
+// Rewrite cloaked tool names in a single complete SSE line. Passes through
+// lines that aren't `data:` carriers, the [DONE] sentinel, or don't carry a
+// tool_use at all. Returns the same string reference if nothing changed.
+//
+// Applied at the INPUT side of the transform (raw Claude SSE bytes, one
+// complete line at a time), so the translator never sees cloaked names
+// and downstream stages can stay format-agnostic. See claudeCloaking.js
+// for the full "exec_ide" symptom writeup.
+function decloakSSELine(line, toolNameMap) {
+  if (!line.startsWith("data:") || !line.includes("tool_use")) return line;
+  const payload = line.slice(5).trimStart();
+  if (!payload || payload === "[DONE]") return line;
+  try {
+    const parsed = JSON.parse(payload);
+    const decloaked = decloakToolNames(parsed, toolNameMap);
+    if (decloaked === parsed) return line;
+    return "data: " + JSON.stringify(decloaked);
+  } catch {
+    return line;
+  }
 }
 
 /**
@@ -84,17 +82,21 @@ export function createSSEStream(options = {}) {
   let accumulatedThinking = "";
   let ttftAt = null;
 
-  // Single-point guarantee: if Claude-format cloaked names are in play, every
-  // byte headed to the client first passes through decloakToolNames. This
-  // covers transform AND flush in both translate and passthrough modes, so
-  // new egress paths can't silently re-introduce the leak. See
-  // claudeCloaking.js for the full "exec_ide" symptom writeup.
-  const shouldDecloak = sourceFormat === FORMATS.CLAUDE && toolNameMap?.size > 0;
+  // Single-point guarantee: if cloaking was applied on the request path,
+  // every raw provider-SSE line is decloaked before it hits the buffer-
+  // consuming for-loop (or flush). Since cloakClaudeTools() only fires
+  // when provider === "claude", a populated toolNameMap implies Claude-
+  // shape bytes on the wire — we don't need a sourceFormat check. Doing
+  // the work on the INPUT side means the translator always sees real
+  // tool names, so passthrough AND every translate target (OpenAI,
+  // Gemini, etc.) are covered by the same line of code without knowing
+  // their output tool shapes. See claudeCloaking.js for the full
+  // "exec_ide" symptom writeup.
+  const shouldDecloak = toolNameMap?.size > 0;
 
   function emit(output, controller) {
-    const rewritten = shouldDecloak ? decloakSSEText(output, toolNameMap) : output;
-    reqLogger?.appendConvertedChunk?.(rewritten);
-    controller.enqueue(sharedEncoder.encode(rewritten));
+    reqLogger?.appendConvertedChunk?.(output);
+    controller.enqueue(sharedEncoder.encode(output));
   }
 
   return new TransformStream({
@@ -108,6 +110,12 @@ export function createSSEStream(options = {}) {
 
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
+
+      if (shouldDecloak) {
+        for (let i = 0; i < lines.length; i++) {
+          lines[i] = decloakSSELine(lines[i], toolNameMap);
+        }
+      }
 
       for (const line of lines) {
         const trimmed = line.trim();
@@ -296,9 +304,10 @@ export function createSSEStream(options = {}) {
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
           if (buffer) {
-            let output = buffer;
-            if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
-              output = "data: " + buffer.slice(5);
+            const decloaked = shouldDecloak ? decloakSSELine(buffer, toolNameMap) : buffer;
+            let output = decloaked;
+            if (decloaked.startsWith("data:") && !decloaked.startsWith("data: ")) {
+              output = "data: " + decloaked.slice(5);
             }
             emit(output, controller);
           }
@@ -329,7 +338,8 @@ export function createSSEStream(options = {}) {
         }
 
         if (buffer.trim()) {
-          const parsed = parseSSELine(buffer.trim());
+          const decloaked = shouldDecloak ? decloakSSELine(buffer, toolNameMap) : buffer;
+          const parsed = parseSSELine(decloaked.trim());
           if (parsed && !parsed.done) {
             const translated = translateResponse(targetFormat, sourceFormat, parsed, state);
 
