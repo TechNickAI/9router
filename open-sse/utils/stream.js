@@ -116,17 +116,14 @@ export function createSSEStream(options = {}) {
   let accumulatedThinking = "";
   let ttftAt = null;
 
-  // Single-point guarantee: if cloaking was applied on the request path,
-  // every raw provider-SSE line is decloaked before it hits the buffer-
-  // consuming for-loop (or flush). Since cloakClaudeTools() only fires
-  // when provider === "claude", a populated toolNameMap implies Claude-
-  // shape bytes on the wire — we don't need a sourceFormat check. Doing
-  // the work on the INPUT side means the translator always sees real
-  // tool names, so passthrough AND every translate target (OpenAI,
-  // Gemini, etc.) are covered by the same line of code without knowing
-  // their output tool shapes. See claudeCloaking.js for the full
-  // "exec_ide" symptom writeup.
-  const shouldDecloak = true;
+  // Single-point guarantee: every raw provider-SSE line is decloaked before
+  // it hits the buffer-consuming for-loop (or flush). Since cloakClaudeTools()
+  // only fires when provider === "claude", a populated toolNameMap implies
+  // Claude-shape bytes on the wire — we don't need a sourceFormat check. Doing
+  // the work on the INPUT side means the translator always sees real tool names,
+  // so passthrough AND every translate target (OpenAI, Gemini, etc.) are covered
+  // by the same line of code without knowing their output tool shapes. See
+  // claudeCloaking.js for the full "exec_ide" symptom writeup.
 
   // The map-based decloak is always safe (only rewrites names present in
   // toolNameMap). The suffix-strip fallback in stripClaudeToolSuffixes,
@@ -153,10 +150,8 @@ export function createSSEStream(options = {}) {
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
-      if (shouldDecloak) {
-        for (let i = 0; i < lines.length; i++) {
-          lines[i] = decloakSSELine(lines[i], toolNameMap, allowSuffixFallback);
-        }
+      for (let i = 0; i < lines.length; i++) {
+        lines[i] = decloakSSELine(lines[i], toolNameMap, allowSuffixFallback);
       }
 
       for (const line of lines) {
@@ -346,7 +341,7 @@ export function createSSEStream(options = {}) {
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
           if (buffer) {
-            const decloaked = shouldDecloak ? decloakSSELine(buffer, toolNameMap, allowSuffixFallback) : buffer;
+            const decloaked = decloakSSELine(buffer, toolNameMap, allowSuffixFallback);
             let output = decloaked;
             if (decloaked.startsWith("data:") && !decloaked.startsWith("data: ")) {
               output = "data: " + decloaked.slice(5);
@@ -383,7 +378,7 @@ export function createSSEStream(options = {}) {
         }
 
         if (buffer.trim()) {
-          const decloaked = shouldDecloak ? decloakSSELine(buffer, toolNameMap, allowSuffixFallback) : buffer;
+          const decloaked = decloakSSELine(buffer, toolNameMap, allowSuffixFallback);
           const parsed = parseSSELine(decloaked.trim());
           if (parsed && !parsed.done) {
             const translated = translateResponse(targetFormat, sourceFormat, parsed, state);
